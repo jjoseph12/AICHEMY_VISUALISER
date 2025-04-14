@@ -1,3 +1,7 @@
+# To Run
+python alchemy_dashboard/main.py 
+Open it up on the Corresponding Port link
+
 # To do list 3/28
 
 ## Cole
