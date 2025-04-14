@@ -1,6 +1,6 @@
 # To Run
-- python alchemy_dashboard/main.py 
- Open it up on the local address link
+- python alchemy_dashboard/main.py
+- Open it up on the local address link
 
 # To do list 3/28
 
