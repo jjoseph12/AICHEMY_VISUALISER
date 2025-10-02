@@ -2,10 +2,27 @@
 
 from bokeh.plotting import figure
 from bokeh.layouts import column, row
-from bokeh.models import ColumnDataSource, HoverTool, Legend
+from bokeh.models import ColumnDataSource, HoverTool, Legend, Circle
 from bokeh.embed import components
-from styles import PLOT_COLORS, PRIMARY_COLOR, SECONDARY_COLOR, ACCENT_COLOR, GRID_COLOR, TEXT_COLOR
 import pandas as pd
+import json
+
+# Define colors using CSS variables
+PRIMARY_COLOR = "#4F46E5"  # var(--primary)
+SECONDARY_COLOR = "#0EA5E9"  # var(--secondary)
+ACCENT_COLOR = "#F59E0B"  # var(--accent)
+GRID_COLOR = "#E2E8F0"  # var(--border)
+TEXT_COLOR = "#1E293B"  # var(--text-primary)
+
+# Define plot colors
+PLOT_COLORS = [
+    PRIMARY_COLOR,
+    SECONDARY_COLOR,
+    ACCENT_COLOR,
+    "#10B981",  # var(--success)
+    "#EF4444",  # var(--error)
+    "#F59E0B",  # var(--warning)
+]
 
 def create_styled_figure(title, x_label, y_label, width=800, height=300):
     """Create a styled Bokeh figure with consistent formatting."""
@@ -29,24 +46,24 @@ def create_styled_figure(title, x_label, y_label, width=800, height=300):
 
     fig.axis.axis_line_color = "#BDBDBD"
     fig.axis.major_tick_line_color = "#BDBDBD"
-    fig.axis.major_label_text_font = "Roboto"
+    fig.axis.major_label_text_font = "Poppins"
     fig.axis.major_label_text_color = TEXT_COLOR
     fig.axis.major_label_text_font_size = "11px"
 
-    fig.title.text_font = "Roboto"
+    fig.title.text_font = "Poppins"
     fig.title.text_font_size = "16px"
     fig.title.text_font_style = "bold"
     fig.title.text_color = TEXT_COLOR
     fig.title.align = "center"
     fig.title.text_alpha = 0.85
 
-    fig.xaxis.axis_label_text_font = "Roboto"
+    fig.xaxis.axis_label_text_font = "Poppins"
     fig.xaxis.axis_label_text_font_size = "13px"
     fig.xaxis.axis_label_text_font_style = "normal"
     fig.xaxis.axis_label_text_color = TEXT_COLOR
     fig.xaxis.axis_label_text_alpha = 0.75
 
-    fig.yaxis.axis_label_text_font = "Roboto"
+    fig.yaxis.axis_label_text_font = "Poppins"
     fig.yaxis.axis_label_text_font_size = "13px"
     fig.yaxis.axis_label_text_font_style = "normal"
     fig.yaxis.axis_label_text_color = TEXT_COLOR
@@ -141,128 +158,132 @@ def create_styled_figure(title, x_label, y_label, width=800, height=300):
 
 
 
-from bokeh.models import ColumnDataSource, HoverTool, TapTool, CustomJS, Circle
+from bokeh.models import ColumnDataSource, HoverTool, TapTool, CustomJS
 
 def plot_experiment_metrics(df):
     """
     Create plots for a single experiment's metrics.
     
     Args:
-        df (DataFrame): DataFrame with collision_number, entropy, unique_expressions_count
+        df (pandas.DataFrame): DataFrame containing metrics data
         
     Returns:
-        list: List of Bokeh figure objects
+        dict: Dictionary of Bokeh figure objects, keyed by plot type
     """
-    source = ColumnDataSource(data=dict(
-        x=df['collision_number'],
-        entropy=df['entropy'],
-        unique=df['unique_expressions_count'],
-        total=df.get('total_expressions', [0] * len(df))
-    ))
-
-    # === Entropy plot ===
-    entropy_plot = create_styled_figure("Entropy Over Time", "Collision Number", "Entropy")
-
-    # First the line (non-selectable)
-    entropy_plot.line('x', 'entropy', source=source, line_width=2.5, color=PRIMARY_COLOR, line_alpha=0.8)
-
-    # ✅ Scatter must be selectable, so store it
-    scatter_renderer = entropy_plot.scatter('x', 'entropy', source=source, size=8,
-                                            color=PRIMARY_COLOR, alpha=0.6)
-
-    # Define how selection and non-selection looks
-    scatter_renderer.selection_glyph = Circle(fill_color="red", line_color="red", size=10)
-    scatter_renderer.nonselection_glyph = Circle(fill_color=PRIMARY_COLOR, fill_alpha=0.3, size=8)
-
-    from bokeh.models import ColumnDataSource, HoverTool, TapTool, CustomJS, Circle
-
-
-
-from bokeh.models import ColumnDataSource, HoverTool, TapTool, CustomJS, Circle
-
-def plot_experiment_metrics(df):
-    """
-    Create plots for a single experiment's metrics.
+    from bokeh.plotting import figure
+    from bokeh.models import ColumnDataSource, HoverTool, BoxSelectTool, LassoSelectTool
+    from bokeh.layouts import column
     
-    Args:
-        df (DataFrame): DataFrame with collision_number, entropy, unique_expressions_count
+    # Debug: Print DataFrame info to understand the data structure
+    print(f"[DEBUG] DataFrame shape: {df.shape}")
+    print(f"[DEBUG] DataFrame columns: {df.columns.tolist()}")
+    print(f"[DEBUG] DataFrame head:\n{df.head()}")
+    
+    # Check if required columns exist
+    required_columns = ['collision_number', 'entropy', 'unique_expressions_count']
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        print(f"[ERROR] Missing columns: {missing_columns}")
+        # Try to find alternative column names
+        if 'unique_expressions' in df.columns:
+            df = df.rename(columns={'unique_expressions': 'unique_expressions_count'})
+            print("[INFO] Renamed 'unique_expressions' to 'unique_expressions_count'")
+        elif 'len_unique_expressions' in df.columns:
+            df = df.rename(columns={'len_unique_expressions': 'unique_expressions_count'})
+            print("[INFO] Renamed 'len_unique_expressions' to 'unique_expressions_count'")
+    
+    # Create separate ColumnDataSources for each plot
+    entropy_source = ColumnDataSource(df)
+    unique_expressions_source = ColumnDataSource(df)
+    
+    # Create entropy plot
+    entropy_plot = create_styled_figure("Entropy Over Time", "Collision Number", "Entropy", width=800, height=400)
+    
+    # Add line and scatter for entropy, using its own source
+    entropy_plot.line('collision_number', 'entropy', source=entropy_source, line_width=2, color=PRIMARY_COLOR)
+    entropy_plot.scatter('collision_number', 'entropy', source=entropy_source, 
+                        size=8, color=PRIMARY_COLOR, alpha=0.6, selection_color='red',
+                        nonselection_alpha=0.1)
+    
+    # Add hover tool for entropy
+    entropy_hover = HoverTool(
+        tooltips=[
+            ("Collision", "@collision_number"),
+            ("Entropy", "@entropy{0.0000}")
+        ]
+    )
+    entropy_plot.add_tools(entropy_hover)
+    
+    # Create unique expressions plot
+    unique_expressions_plot = create_styled_figure("Unique Expressions Over Time", "Collision Number", "Unique Expressions Count", width=800, height=400)
+    
+    # Debug: Check if unique_expressions_count column exists and has data
+    if 'unique_expressions_count' in df.columns:
+        print(f"[DEBUG] Unique expressions data: {df['unique_expressions_count'].tolist()}")
         
-    Returns:
-        list: List of Bokeh figure objects
-    """
-    source = ColumnDataSource(data=dict(
-        x=df['collision_number'],
-        entropy=df['entropy'],
-        unique=df['unique_expressions_count'],
-        total=df.get('total_expressions', [0] * len(df))
-    ))
+        # Add line and scatter for unique expressions, using its own source
+        unique_expressions_plot.line('collision_number', 'unique_expressions_count', source=unique_expressions_source, 
+                                     line_width=2, color=SECONDARY_COLOR)
+        unique_expressions_plot.scatter('collision_number', 'unique_expressions_count', source=unique_expressions_source, 
+                                        size=8, color=SECONDARY_COLOR, alpha=0.6, selection_color='red',
+                                        nonselection_alpha=0.1)
+        
+        # Add hover tool for unique expressions
+        unique_expressions_hover = HoverTool(
+            tooltips=[
+                ("Collision", "@collision_number"),
+                ("Unique Expressions", "@unique_expressions_count")
+            ]
+        )
+        unique_expressions_plot.add_tools(unique_expressions_hover)
+    else:
+        print(f"[ERROR] 'unique_expressions_count' column not found. Available columns: {df.columns.tolist()}")
+        # Create an empty plot with error message
+        unique_expressions_plot.text(x=[400], y=[200], text=["No unique expressions data available"], 
+                                   text_font_size="16px", text_color="red")
+    
+    # Add TapTool to entropy plot
+    entropy_plot.add_tools(TapTool())
 
-    # === Entropy plot ===
-    entropy_plot = create_styled_figure("Entropy Over Time", "Collision Number", "Entropy")
-
-    # Line (non-selectable)
-    entropy_plot.line('x', 'entropy', source=source, line_width=2.5, color=PRIMARY_COLOR, line_alpha=0.8)
-
-    # ✅ Scatter (selectable) + selection styling
-    scatter_renderer = entropy_plot.scatter('x', 'entropy', source=source, size=8,
-                                            color=PRIMARY_COLOR, alpha=0.6)
-    scatter_renderer.selection_glyph = Circle(fill_color="red", line_color="red", size=10)
-    scatter_renderer.nonselection_glyph = Circle(fill_color=PRIMARY_COLOR, fill_alpha=0.2, size=8)
-
-    # Hover tool
-    entropy_plot.add_tools(HoverTool(tooltips=[
-        ("Collision", "@x"),
-        ("Entropy", "@entropy{0.0000}")
-    ], mode='vline'))
-
-    # Tap tool
-    tap_tool = TapTool()
-    entropy_plot.add_tools(tap_tool)
-    entropy_plot.toolbar.active_tap = tap_tool
-    entropy_plot.toolbar.active_tap = entropy_plot.select(dict(type=TapTool))[0]
-
-    # ✅ JS Callback
-    tap_callback = CustomJS(args=dict(source=source), code="""
+    # Add JS callback for tap
+    tap_callback = CustomJS(args=dict(source=entropy_source), code="""
         const selected_index = source.selected.indices[0];
-        console.log("TAP CLICKED:", selected_index);
         if (selected_index != null) {
-            const collision = source.data['x'][selected_index];
-            fetch(`/get_entropy_detail/${collision}?config_id=${window.currentConfigID}`)
-                .then(response => response.text())
+            const collision = source.data['collision_number'][selected_index];
+            const configId = window.currentConfigID;
+            if (!configId || configId === 'undefined') {
+                console.error('No valid config ID available');
+                return;
+            }
+            fetch(`/get_entropy_detail/${collision}?config_id=${configId}`)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    return response.text();
+                })
                 .then(html => {
-                    const target = document.getElementById("entropy-details");
+                    const target = document.getElementById("histogram-content");
                     if (target) {
                         target.innerHTML = html;
                         target.scrollIntoView({ behavior: "smooth" });
                     }
+                })
+                .catch(error => {
+                    console.error('Error fetching histogram:', error);
+                    const target = document.getElementById("histogram-content");
+                    if (target) {
+                        target.innerHTML = '<p style="color: red;">Error loading histogram. Please try again.</p>';
+                    }
                 });
         }
     """)
-    source.selected.js_on_change('indices', tap_callback)
+    entropy_source.selected.js_on_change('indices', tap_callback)
 
-    # === Unique expressions plot ===
-    unique_plot = create_styled_figure("Unique Expressions Over Time", "Collision Number", "Count")
-    unique_plot.line('x', 'unique', source=source, line_width=2.5, color=SECONDARY_COLOR, line_alpha=0.8)
-    unique_plot.scatter('x', 'unique', source=source, size=6, color=SECONDARY_COLOR, alpha=0.6)
-    unique_plot.add_tools(HoverTool(tooltips=[
-        ("Collision", "@x"),
-        ("Unique Expressions", "@unique")
-    ], mode='vline'))
-
-    plots = [entropy_plot, unique_plot]
-
-    # === Optional: Total expressions plot ===
-    if 'total_expressions' in df.columns:
-        total_plot = create_styled_figure("Total Expressions Over Time", "Collision Number", "Count")
-        total_plot.line('x', 'total', source=source, line_width=2.5, color=ACCENT_COLOR, line_alpha=0.8)
-        total_plot.scatter('x', 'total', source=source, size=6, color=ACCENT_COLOR, alpha=0.6)
-        total_plot.add_tools(HoverTool(tooltips=[
-            ("Collision", "@x"),
-            ("Total Expressions", "@total")
-        ], mode='vline'))
-        plots.append(total_plot)
-
-    return plots
+    return {
+        'entropy_plot': entropy_plot,
+        'unique_expressions_plot': unique_expressions_plot
+    }
 
 
 
@@ -519,3 +540,14 @@ def generate_bokeh_components(config_id):
     full_script = script1 + "\n" + script2
 
     return full_script, div1, div2
+
+def get_simulation_components(results_path: str):
+    """
+    Load results from JSON, generate Bokeh layout, return script and div.
+    """
+    with open(results_path, "r") as f:
+        results = json.load(f)
+
+    layout = plot_simulation_metrics(results)
+    script, div = components(column(layout))
+    return script, div

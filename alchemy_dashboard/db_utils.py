@@ -4,7 +4,9 @@ import os
 import sqlite3
 import json
 import pandas as pd
-from config import DB_NAME
+
+# Get the absolute path to the database
+DB_NAME = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'alchemy_experiments.db'))
 
 
 def check_database_exists(db_path=DB_NAME):
@@ -21,21 +23,29 @@ def get_experiment_configs(db_path=DB_NAME):
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT 
-            config_id, 
-            random_seed,
-            generator_type, 
-            total_collisions, 
-            polling_frequency, 
-            timestamp,
-            name
-        FROM Configurations 
-        ORDER BY timestamp DESC
-    """)
-    configs = cursor.fetchall()
-    conn.close()
-    return configs
+    try:
+        cursor.execute("""
+            SELECT 
+                config_id, 
+                random_seed,
+                generator_type, 
+                total_collisions, 
+                polling_frequency, 
+                timestamp,
+                name
+            FROM Configurations 
+            ORDER BY timestamp DESC
+        """)
+        configs = cursor.fetchall()
+        # Debug print
+        print("Fetched configs:", configs)
+        return configs
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return []
+    finally:
+        conn.close()
+
 # Update get_experiment_details to include the name field
 def get_experiment_details(config_id, db_path=DB_NAME):
     """Get detailed information about a specific experiment."""
@@ -87,12 +97,6 @@ def get_experiment_details(config_id, db_path=DB_NAME):
     return config, metrics, initial_expressions
 
 import pandas as pd
-from config import DB_NAME
-
-
-import sqlite3
-import pandas as pd
-from config import DB_NAME
 
 def query_df_by_config_id(config_id):
     """
@@ -117,15 +121,35 @@ def query_df_by_config_id(config_id):
 
 def process_collision_data(metrics):
     """Process collision metrics data into a DataFrame for plotting."""
+    print(f"[DEBUG] process_collision_data called with {len(metrics)} metrics")
+    if metrics:
+        print(f"[DEBUG] First metric: {metrics[0]}")
+    
     data = []
     for metric in metrics:
-        collision_number, entropy, unique_expressions = metric
-        data.append({
-            'collision_number': collision_number,
-            'entropy': entropy,
-            'unique_expressions_count': unique_expressions
-        })
-    return pd.DataFrame(data)
+        # Handle both tuple and dictionary formats
+        if isinstance(metric, dict):
+            data.append({
+                'collision_number': metric['collision_number'],
+                'entropy': metric['entropy'],
+                'unique_expressions_count': metric['unique_expressions']
+            })
+        else:
+            # Handle tuple format (legacy)
+            collision_number, entropy, unique_expressions = metric
+            data.append({
+                'collision_number': collision_number,
+                'entropy': entropy,
+                'unique_expressions_count': unique_expressions
+            })
+    
+    df = pd.DataFrame(data)
+    print(f"[DEBUG] Created DataFrame with shape: {df.shape}")
+    print(f"[DEBUG] DataFrame columns: {df.columns.tolist()}")
+    if not df.empty:
+        print(f"[DEBUG] First row: {df.iloc[0].to_dict()}")
+    
+    return df
 
 
 def get_expressions_for_collision(config_id, collision_number, db_path=DB_NAME):
@@ -216,7 +240,6 @@ def get_experiment_metrics(config_ids, metric_name, db_path=DB_NAME):
     conn.close()
     return result
 import sqlite3
-from config import DB_NAME
 import json
 
 # Update get_experiment_details_and_expressions to include the name field
@@ -248,6 +271,9 @@ def get_experiment_details_and_expressions(config_id):
             generator_params = {}
     else:
         generator_params = {}
+
+    if config["freevar_generation_probability"] is not None and isinstance(generator_params, dict):
+        generator_params.setdefault('freevar_probability', config["freevar_generation_probability"])
 
     # Get expressions from first collision
     cursor.execute('''

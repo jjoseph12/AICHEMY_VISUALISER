@@ -1,10 +1,22 @@
 import os
 import json
+import io
+from collections import Counter
 from flask import Flask, render_template, request, redirect, url_for, jsonify, send_file
 from bokeh.resources import CDN
 from simulation import run_experiment
-from visualization import get_simulation_components
-from models import init_database, save_configuration, save_experiment_state, save_averages, get_experiment_configs
+from plotting import get_simulation_components, plot_experiment_metrics
+from models import (
+    init_database,
+    save_configuration,
+    save_experiment_state,
+    save_averages,
+    get_experiment_configs,
+    save_continuation_metadata,
+    get_continuation_metadata,
+    update_experiment_name,
+    delete_experiment
+)
 from db_utils import (
     get_experiment_details, 
     process_collision_data,
@@ -13,6 +25,8 @@ from db_utils import (
 )
 from plotting import create_bokeh_plots_from_metrics
 import re
+from werkzeug.utils import secure_filename
+from bokeh.embed import components
 
 app = Flask(__name__)
 
@@ -38,81 +52,390 @@ def index():
             script, div = "", ""
     else:
         script, div = "", ""
-    return render_template('index_with_bokeh.html', bokeh_script=script, bokeh_div=div)
+    return render_template('home.html', active_page='home', bokeh_script=script, bokeh_div=div)
 
-# Update the run_simulation_form route to handle experiment names
+@app.route('/database')
+def database_view():
+    """View database contents and experiment details."""
+    configs = get_experiment_configs()
+    
+    # Create a default experiment if no configs exist
+    if not configs:
+        default_experiment = {
+            'config_id': 0,
+            'name': 'No experiments available',
+            'generator_type': '',
+            'total_collisions': 0,
+            'polling_frequency': 0,
+            'timestamp': '',
+            'generator_params': {},
+            'initial_expressions': []
+        }
+        return render_template('database_view.html',
+                             experiment=default_experiment,
+                             initial_expressions=[],
+                             bokeh_script='',
+                             bokeh_div='',
+                             active_page='database')
+    
+    # Get the most recent experiment's details
+    latest_config = configs[0]  # Most recent config is first due to ORDER BY timestamp DESC
+    
+    # Debug print to see the structure
+    print("Latest config structure:", latest_config)
+    
+    # Get experiment details
+    config, metrics, initial_expressions = get_experiment_details(latest_config['config_id'])
+    
+    if not config:
+        return "Experiment not found", 404
+    
+    # Format experiment details
+    try:
+        stored_params = json.loads(config[5]) if config[5] else {}
+    except json.JSONDecodeError:
+        stored_params = {}
+
+    if config[6] is not None:
+        stored_params.setdefault('freevar_probability', config[6])
+
+    continuation_meta = get_continuation_metadata(config[0])
+
+    experiment = {
+        'config_id': config[0],
+        'name': config[8] or f'Experiment {config[0]}',  # name is the 9th element (index 8)
+        'generator_type': config[2],
+        'total_collisions': config[3],
+        'polling_frequency': config[4],
+        'timestamp': config[7],
+        'generator_params': stored_params,
+        'continuation': continuation_meta
+    }
+    
+    # Format initial expressions
+    formatted_expressions = [expr[0] for expr in initial_expressions]
+    
+    # Generate Bokeh components for the plots
+    if metrics:
+        # Process metrics data into a DataFrame
+        df = process_collision_data(metrics)
+        plots = plot_experiment_metrics(df)
+        entropy_script, entropy_div = components(plots['entropy_plot'])
+        unique_script, unique_div = components(plots['unique_expressions_plot'])
+    else:
+        entropy_script, entropy_div = '', ''
+        unique_script, unique_div = '', ''
+    
+    return render_template('database_view.html',
+                         experiment=experiment,
+                         initial_expressions=formatted_expressions,
+                         bokeh_script=entropy_script,
+                         bokeh_div=entropy_div,
+                         unique_expressions_script=unique_script,
+                         unique_expressions_div=unique_div,
+                         active_page='database')
+
+@app.route('/simulation')
+def simulation():
+    return render_template('simulation.html', active_page='simulation')
+
+
+@app.route('/api/continuation_config/<int:config_id>')
+def continuation_config(config_id):
+    try:
+        config, metrics, _ = get_experiment_details(config_id)
+        if not config:
+            return jsonify({'status': 'error', 'message': 'Experiment not found'}), 404
+
+        try:
+            generator_params = json.loads(config[5]) if config[5] else {}
+        except json.JSONDecodeError:
+            generator_params = {}
+
+        if config[6] is not None:
+            generator_params.setdefault('freevar_probability', config[6])
+
+        final_state = get_expressions_for_collision(config_id, -1)
+        final_population = sum(count for _, count in final_state) if final_state else 0
+        last_collision_number = metrics[-1][0] if metrics else None
+
+        payload = {
+            'status': 'success',
+            'config_id': config_id,
+            'name': config[8] or f'Experiment {config_id}',
+            'generator_type': config[2],
+            'total_collisions': config[3],
+            'polling_frequency': config[4],
+            'random_seed': config[1],
+            'generator_params': generator_params,
+            'default_fraction': 0.5,
+            'final_population': final_population,
+            'last_collision_number': last_collision_number
+        }
+
+        return jsonify(payload)
+    except Exception as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
+
+
+@app.route('/download_initial_state/<int:config_id>')
+def download_initial_state(config_id):
+    try:
+        config, _, initial_expressions = get_experiment_details(config_id)
+        if not config:
+            return "Experiment not found", 404
+
+        continuation = get_continuation_metadata(config_id)
+        payload = {
+            'config_id': config_id,
+            'name': config[8] or f'Experiment {config_id}',
+            'generator_type': config[2],
+            'random_seed': config[1],
+            'total_collisions': config[3],
+            'polling_frequency': config[4],
+            'timestamp': config[7],
+            'continuation': continuation,
+            'initial_expression_counts': [
+                {'expression': expr, 'count': count}
+                for expr, count in initial_expressions
+            ]
+        }
+
+        if not payload['initial_expression_counts']:
+            return "No initial expressions recorded for this experiment", 404
+
+        buffer = io.BytesIO()
+        buffer.write(json.dumps(payload, indent=2).encode('utf-8'))
+        buffer.seek(0)
+
+        filename = f"experiment_{config_id}_initial_state.json"
+        return send_file(buffer, mimetype='application/json', as_attachment=True, download_name=filename)
+    except Exception as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
+
+
+@app.route('/download_final_state/<int:config_id>')
+def download_final_state(config_id):
+    try:
+        config, metrics, _ = get_experiment_details(config_id)
+        if not config:
+            return "Experiment not found", 404
+
+        final_state = get_expressions_for_collision(config_id, -1)
+        if not final_state:
+            return "No final state data available for this experiment", 404
+
+        last_collision = metrics[-1][0] if metrics else None
+        payload = {
+            'config_id': config_id,
+            'name': config[8] or f'Experiment {config_id}',
+            'generator_type': config[2],
+            'timestamp': config[7],
+            'last_collision_number': last_collision,
+            'final_state_counts': [
+                {'expression': expr, 'count': count}
+                for expr, count in final_state
+            ]
+        }
+
+        buffer = io.BytesIO()
+        buffer.write(json.dumps(payload, indent=2).encode('utf-8'))
+        buffer.seek(0)
+
+        filename = f"experiment_{config_id}_final_state.json"
+        return send_file(buffer, mimetype='application/json', as_attachment=True, download_name=filename)
+    except Exception as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
+
+
+@app.route('/delete_experiment', methods=['POST'])
+def delete_experiment_route():
+    try:
+        payload = request.get_json(silent=True) or {}
+        config_id = payload.get('config_id')
+        if not config_id:
+            return jsonify({'status': 'error', 'message': 'Missing config_id'}), 400
+
+        success = delete_experiment(int(config_id))
+        if success:
+            return jsonify({'status': 'success'})
+        return jsonify({'status': 'error', 'message': 'Failed to delete experiment'}), 500
+    except Exception as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
+
+
 @app.route('/run_simulation_form', methods=['POST'])
 def run_simulation_form():
     try:
-        # Extract form data
-        generator_type = request.form.get('generator_type', 'Fontana')
+        # Get form data
+        generator_type = request.form.get('generator_type', 'BTree')
         total_collisions = int(request.form.get('total_collisions', 1000))
         polling_frequency = int(request.form.get('polling_frequency', 10))
         random_seed = int(request.form.get('random_seed', 42))
         experiment_name = request.form.get('experiment_name', '')
-        
-        # Build configuration based on generator type
+
+        continuation_parent_id = request.form.get('continuation_parent_id')
+        continuation_fraction_raw = request.form.get('continuation_fraction')
+        continuation_info = None
+        fraction_value = 0.0
+
+        if continuation_parent_id:
+            parent_id = int(continuation_parent_id)
+            try:
+                fraction_value = float(continuation_fraction_raw or 0)
+            except ValueError:
+                fraction_value = 0.0
+
+            if fraction_value > 1:
+                fraction_value = fraction_value / 100.0
+
+            fraction_value = max(0.0, min(1.0, fraction_value))
+
+            continuation_info = {
+                'parent_config_id': parent_id,
+                'fraction': fraction_value
+            }
+        else:
+            parent_id = None
+
+        # Build config dictionary
         config = {
-            "random_seed": random_seed,
-            "total_collisions": total_collisions,
-            "polling_frequency": polling_frequency,
-            "name": experiment_name if experiment_name else None,
-            "input_expressions": {
-                "generator": generator_type,
-                "params": {}
-            }
+            'generator_type': generator_type,
+            'total_collisions': total_collisions,
+            'polling_frequency': polling_frequency,
+            'random_seed': random_seed,
+            'experiment_name': experiment_name
         }
-        
+
+        if continuation_info:
+            config['continuation'] = continuation_info
+
+        generator_params_payload = {}
+
         # Add generator-specific parameters
-        if generator_type == "BTree":
-            config["input_expressions"]["params"] = {
-                "size": int(request.form.get('btree_size', 5)),
-                "freevar_generation_probability": float(request.form.get('freevar_probability', 0.5)),
-                "max_free_vars": int(request.form.get('max_free_vars', 3)),
-                "standardization": request.form.get('standardization', 'prefix'),
-                "num_expressions": int(request.form.get('num_expressions', 10))
+        if generator_type == 'BTree':
+            size = int(request.form.get('btree_size', 5))
+            freevar_probability = float(request.form.get('freevar_probability', 0.5))
+            max_free_vars = int(request.form.get('max_free_vars', 3))
+            standardization = request.form.get('standardization', 'prefix')
+            num_expressions = int(request.form.get('num_expressions', 10))
+
+            config.update({
+                'size': size,
+                'freevar_probability': freevar_probability,
+                'max_free_vars': max_free_vars,
+                'standardization': standardization,
+                'num_expressions': num_expressions
+            })
+
+            generator_params_payload = {
+                'size': size,
+                'freevar_probability': freevar_probability,
+                'max_free_vars': max_free_vars,
+                'standardization': standardization,
+                'num_expressions': num_expressions
             }
-        elif generator_type == "Fontana":
-            config["input_expressions"]["params"] = {
-                "abs_range": [
-                    float(request.form.get('abs_low', 0.1)),
-                    float(request.form.get('abs_high', 0.5))
-                ],
-                "app_range": [
-                    float(request.form.get('app_low', 0.2)),
-                    float(request.form.get('app_high', 0.6))
-                ],
-                "max_depth": int(request.form.get('max_depth', 5)),
-                "max_free_vars": int(request.form.get('fontana_max_fv', 2))
+        elif generator_type == 'Fontana':
+            abs_low = float(request.form.get('abs_low', 0.1))
+            abs_high = float(request.form.get('abs_high', 0.5))
+            app_low = float(request.form.get('app_low', 0.2))
+            app_high = float(request.form.get('app_high', 0.6))
+            max_depth = int(request.form.get('max_depth', 5))
+            max_free_vars = int(request.form.get('fontana_max_fv', 2))
+            expression_count = int(request.form.get('fontana_expression_count', 10))
+
+            config.update({
+                'abs_low': abs_low,
+                'abs_high': abs_high,
+                'app_low': app_low,
+                'app_high': app_high,
+                'max_depth': max_depth,
+                'max_free_vars': max_free_vars,
+                'initial_expression_count': expression_count
+            })
+
+            generator_params_payload = {
+                'abs_low': abs_low,
+                'abs_high': abs_high,
+                'app_low': app_low,
+                'app_high': app_high,
+                'max_depth': max_depth,
+                'max_free_vars': max_free_vars,
+                'initial_expression_count': expression_count
             }
-        elif generator_type == "from_file":
-            # For file-based input, check if a file was uploaded
-            if 'expressions_file' in request.files and request.files['expressions_file'].filename:
+        elif generator_type == 'from_file':
+            if 'expressions_file' in request.files:
                 file = request.files['expressions_file']
-                file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-                file.save(file_path)
-                config["input_expressions"]["params"] = {"filename": file_path}
-            else:
-                # Use direct input if provided
-                direct_input = request.form.get('direct_input', '')
-                if direct_input.strip():
-                    temp_path = os.path.join(app.config['UPLOAD_FOLDER'], f"direct_input_{random_seed}.txt")
-                    with open(temp_path, 'w') as f:
-                        f.write(direct_input)
-                    config["input_expressions"]["params"] = {"filename": temp_path}
-                else:
-                    return jsonify({
-                        "status": "error",
-                        "message": "No expressions provided for 'from_file' generator"
-                    })
-        
-        # Run the experiment with parsed config
+                if file.filename:
+                    filename = secure_filename(file.filename)
+                    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                    file.save(filepath)
+                    config['file_path'] = filepath
+                    generator_params_payload = {
+                        'input_mode': 'file',
+                        'filename': filename
+                    }
+            elif request.form.get('direct_input'):
+                expressions = [expr for expr in request.form.get('direct_input').split('\n') if expr.strip()]
+                config['expressions'] = expressions
+                generator_params_payload = {
+                    'input_mode': 'direct_input',
+                    'expression_count': len(expressions)
+                }
+
+        # Run the experiment
         result = run_experiment(config)
-        
-        # Get experiment details for charts
-        config_id = result['config_id']
-        config_details, metrics, initial_expressions = get_experiment_details(config_id)
-        
+
+        # Save to database
+        config_id = save_configuration(
+            random_seed=random_seed,
+            generator_type=generator_type,
+            total_collisions=total_collisions,
+            polling_frequency=polling_frequency,
+            probability_range=json.dumps(generator_params_payload) if generator_params_payload else None,
+            freevar_generation_probability=config.get('freevar_probability') if generator_type == 'BTree' else None,
+            name=experiment_name
+        )
+
+        # Save initial expressions
+        initial_expressions = result.get('initial_expressions', [])
+        initial_counts = Counter(initial_expressions)
+        for expr, count in initial_counts.items():
+            save_experiment_state(config_id, 0, expr, count)
+
+        # Save metrics and full state data
+        metrics = result.get('metrics', [])
+        for metric in metrics:
+            save_averages(
+                config_id,
+                metric['collision_number'],
+                metric['entropy'],
+                metric['unique_expressions']
+            )
+            
+            # Save full state expressions if available
+            if 'expressions' in metric:
+                collision_number = metric['collision_number']
+                expressions = metric['expressions']
+                
+                # Count frequency of each expression
+                expression_counts = Counter(expressions)
+                
+                # Save each expression with its count
+                for expr, count in expression_counts.items():
+                    save_experiment_state(config_id, collision_number, expr, count)
+
+        continuation_summary = result.get('continuation_summary', {})
+        if continuation_summary and continuation_summary.get('parent_config_id'):
+            save_continuation_metadata(
+                config_id,
+                continuation_summary['parent_config_id'],
+                continuation_summary.get('fraction_used', 0.0),
+                continuation_summary.get('continued_expression_count', 0),
+                continuation_summary.get('new_expression_count', 0)
+            )
+
+        # Generate charts
         if metrics:
             df = process_collision_data(metrics)
             
@@ -122,38 +445,33 @@ def run_simulation_form():
             
             plots = plot_experiment_metrics(df)
             
-            if len(plots) >= 2:
-                # Create separate components for each plot
-                entropy_script, entropy_div = components(plots[0])
-                unique_script, unique_div = components(plots[1])
-                
-                # Combine scripts for template compatibility
-                bokeh_script = entropy_script + unique_script
-            else:
-                bokeh_script, entropy_div, unique_div = "", "", ""
+            # Get components for individual plots
+            entropy_script, entropy_div = components(plots['entropy_plot'])
+            unique_script, unique_div = components(plots['unique_expressions_plot'])
+
+            bokeh_script = entropy_script + unique_script # Combine for embedding if needed, or pass separately
+            bokeh_div = entropy_div + unique_div # Combine for embedding
         else:
-            bokeh_script, entropy_div, unique_div = "", "", ""
+            bokeh_script, bokeh_div = "", ""
         
-        response = {
-            "status": "success",
-            "config_id": config_id,
-            "experiment_name": config_details[8] if len(config_details) > 8 else f"Experiment {config_id}",
-            "initial_expressions": len(initial_expressions) if initial_expressions else 0,
-            "charts": {
-                "entropy_div": entropy_div,
-                "unique_div": unique_div,
-                "script": bokeh_script
-            }
-        }
-        return jsonify(response)
-        
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
         return jsonify({
-            "status": "error",
-            "message": str(e)
+            'status': 'success',
+            'config_id': config_id,
+            'experiment_name': experiment_name or f"Experiment {config_id}",
+            'initial_expressions': initial_expressions,
+            'initial_expression_count': len(initial_expressions),
+            'continuation_summary': continuation_summary,
+            'download_initial_state_url': url_for('download_initial_state', config_id=config_id) if continuation_summary and continuation_summary.get('parent_config_id') else None,
+            'bokeh_div': bokeh_div,  # This will contain both divs concatenated
+            'script': bokeh_script, # This will contain both scripts concatenated
+            'message': f"Simulation completed successfully! You can view the results in the database view."
         })
+
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f"Error running simulation: {str(e)}"
+        }), 500
 
 @app.route('/debug_db')
 def debug_db():
@@ -189,34 +507,46 @@ def view_experiment(config_id):
     df = process_collision_data(metrics)
     
     # Create plots
-    from bokeh.embed import components
     from plotting import plot_experiment_metrics
+    from bokeh.embed import components
     
     plots = plot_experiment_metrics(df)
-    script, div = components(plots[0])  # Just get the first plot for now
+    entropy_script, entropy_div = components(plots['entropy_plot'])
+    unique_script, unique_div = components(plots['unique_expressions_plot'])
     
-    # Prepare context data for template
-    context = {
+    # Format experiment details
+    experiment_details = {
         'config_id': config[0],
         'random_seed': config[1],
         'generator_type': config[2],
         'total_collisions': config[3],
         'polling_frequency': config[4],
-        'probability_range': config[5],
-        'freevar_probability': config[6],
+        'generator_params': {
+            'freevar_generation_probability': config[6] if config[6] is not None else 0.5,
+            'probability_range': json.loads(config[5]) if config[5] else {}
+        },
         'timestamp': config[7],
-        'name': config[8] if len(config) > 8 else f"Experiment {config[0]}",
-        'initial_expressions': len(initial_expressions),
-        'bokeh_script': script,
-        'bokeh_div': div
+        'name': config[8] or f"Experiment {config_id}"
     }
     
-    return render_template('experiment_details.html', **context)
+    # Format initial expressions
+    formatted_expressions = [expr[0] for expr in initial_expressions]
+    
+    return render_template(
+        'database_view.html',
+        experiment=experiment_details,
+        initial_expressions=formatted_expressions,
+        bokeh_script=entropy_script,
+        bokeh_div=entropy_div,
+        unique_expressions_script=unique_script,
+        unique_expressions_div=unique_div,
+        active_page='database'
+    )
 
 
 @app.route('/upload_json', methods=['POST'])
 def upload_json():
-    print("✅ upload_json route registered")
+    print("upload_json route registered")
     if 'json_file' not in request.files:
         return jsonify({'status': 'error', 'message': 'No file uploaded.'})
     file = request.files['json_file']
@@ -259,45 +589,6 @@ def generate_visuals(filename):
     except Exception as e:
         return jsonify({'status': 'error', 'message': f'Unexpected error: {str(e)}'})
     
-
-@app.route('/continue_experiment', methods=['POST'])
-def continue_experiment():
-    config_id = request.form.get('config_id')
-    if not config_id:
-        return "No experiment selected", 400
-    
-    # Get the last experiment state
-    last_expressions = get_expressions_for_collision(config_id, -1)  # -1 for last collision
-    
-    if not last_expressions:
-        return "No expressions found for experiment", 400
-    
-    # Create a temp file with expressions
-    temp_file = os.path.join(app.config['UPLOAD_FOLDER'], f"continue_exp_{config_id}.txt")
-    with open(temp_file, 'w') as f:
-        for expr, count in last_expressions:
-            for _ in range(count):
-                f.write(f"{expr}\n")
-    
-    # Get original config
-    config_details, _, _ = get_experiment_details(config_id)
-    
-    # Prepare new config
-    config = {
-        "random_seed": config_details[1],
-        "total_collisions": config_details[3],
-        "polling_frequency": config_details[4],
-        "input_expressions": {
-            "generator": "from_file",
-            "params": {"filename": temp_file}
-        }
-    }
-    
-    # Run new experiment
-    result = run_experiment(config)
-    
-    return redirect(url_for('view_experiment', config_id=result['config_id']))
-from models import update_experiment_name
 
 # Add this route to update experiment names
 @app.route('/update_experiment_name', methods=['POST'])
@@ -343,19 +634,26 @@ def list_experiments():
     result = {'experiments': []}
     
     for exp in experiments:
-        # Check if exp is a tuple/list or a dictionary
-        if isinstance(exp, (list, tuple)):
-            result['experiments'].append({
+        if isinstance(exp, dict):
+            entry = {
+                'config_id': exp.get('config_id'),
+                'name': exp.get('name'),
+                'generator_type': exp.get('generator_type'),
+                'total_collisions': exp.get('total_collisions'),
+                'polling_frequency': exp.get('polling_frequency'),
+                'timestamp': exp.get('timestamp')
+            }
+        else:
+            entry = {
                 'config_id': exp[0],
                 'random_seed': exp[1],
-                'generator_type': exp[2], 
+                'generator_type': exp[2],
                 'total_collisions': exp[3],
                 'polling_frequency': exp[4],
-                'timestamp': exp[5]
-            })
-        elif isinstance(exp, dict):
-            # If it's already a dictionary, just add it
-            result['experiments'].append(exp)
+                'timestamp': exp[5],
+                'name': exp[8] if len(exp) > 8 else None
+            }
+        result['experiments'].append(entry)
     
     return jsonify(result)
 
@@ -406,17 +704,36 @@ from plotting import generate_bokeh_components  # or whatever file you use
 def get_experiment_plot(config_id):
     try:
         print(f"[DEBUG] Plot request for config_id={config_id}")
-        script, entropy_div, unique_div = generate_bokeh_components(config_id)
+        # Get metrics data for the experiment - we need both entropy and unique_expressions
+        config, metrics, initial_expressions = get_experiment_details(config_id)
+        if not config or not metrics:
+            return jsonify({"status": "error", "message": "No metrics found for this experiment"}), 404
+            
+        # Process the metrics data
+        df = process_collision_data(metrics)
         
-        # Use regex to remove any <script ...> and </script> tags
-        clean_script = re.sub(r'<script[^>]*>', '', script)
-        clean_script = clean_script.replace("</script>", "")
+        # Generate plots
+        from plotting import plot_experiment_metrics
+        from bokeh.embed import components
+        
+        plots = plot_experiment_metrics(df)
+        
+        entropy_script, entropy_div = components(plots['entropy_plot'])
+        unique_script, unique_div = components(plots['unique_expressions_plot'])
+        
+        # Clean up script tags
+        clean_entropy_script = re.sub(r'<script[^>]*>', '', entropy_script)
+        clean_entropy_script = clean_entropy_script.replace("</script>", "")
+
+        clean_unique_script = re.sub(r'<script[^>]*>', '', unique_script)
+        clean_unique_script = clean_unique_script.replace("</script>", "")
         
         return jsonify({
             "status": "success",
-            "script": clean_script,
+            "entropy_script": clean_entropy_script,
             "entropy_div": entropy_div,
-            "unique_div": unique_div
+            "unique_expressions_script": clean_unique_script,
+            "unique_expressions_div": unique_div
         })
     except Exception as e:
         print("[ERROR]", str(e))
@@ -428,7 +745,36 @@ from db_utils import get_experiment_details_and_expressions  # or equivalent
 @app.route('/get_experiment_metadata/<int:config_id>')
 def get_experiment_metadata(config_id):
     try:
-        details, expressions = get_experiment_details_and_expressions(config_id)
+        config, metrics, initial_expressions = get_experiment_details(config_id)
+        if not config:
+            return jsonify({"status": "error", "message": "Experiment not found"}), 404
+            
+        try:
+            generator_params = json.loads(config[5]) if config[5] else {}
+        except json.JSONDecodeError:
+            generator_params = {}
+
+        if config[6] is not None:
+            generator_params.setdefault('freevar_probability', config[6])
+
+        continuation_meta = get_continuation_metadata(config_id)
+
+        # Format experiment details
+        details = {
+            'config_id': config[0],
+            'random_seed': config[1],
+            'generator_type': config[2],
+            'total_collisions': config[3],
+            'polling_frequency': config[4],
+            'generator_params': generator_params,
+            'timestamp': config[7],
+            'name': config[8] or f"Experiment {config_id}",
+            'continuation': continuation_meta
+        }
+
+        # Format expressions
+        expressions = [expr[0] for expr in initial_expressions]
+
         return jsonify({
             "status": "success",
             "details": details,
@@ -442,37 +788,90 @@ from db_utils import get_entropy_and_histogram
 from bokeh.plotting import figure
 from bokeh.embed import components
 
-def create_histogram_bokeh(histogram):
-    expressions = [h["expression"] for h in histogram][:20]
-    counts = [h["count"] for h in histogram][:20]
-
-    p = figure(x_range=expressions, height=300, width=700,
-               title="Top 20 Expressions", toolbar_location=None, tools="")
-    p.vbar(x=expressions, top=counts, width=0.8)
-    p.xaxis.major_label_orientation = 1.2
-    p.xaxis.axis_label = "Expression"
-    p.yaxis.axis_label = "Count"
-    return components(p)
+def create_histogram_html(histogram):
+    """Create a simple HTML histogram without Bokeh dependencies."""
+    if not histogram:
+        return "<p>No data available for this collision.</p>"
+    
+    # Take top 20 expressions
+    top_expressions = histogram[:20]
+    
+    # Find max count for scaling
+    max_count = max(h["count"] for h in top_expressions) if top_expressions else 1
+    
+    html = """
+    <div style="margin: 20px 0;">
+        <h4>Top 20 Expressions by Frequency</h4>
+        <div style="max-height: 400px; overflow-y: auto; border: 1px solid #ddd; padding: 10px;">
+    """
+    
+    for i, item in enumerate(top_expressions):
+        expression = item["expression"]
+        count = item["count"]
+        percentage = (count / max_count) * 100
+        
+        # Truncate long expressions for display
+        display_expr = expression[:50] + "..." if len(expression) > 50 else expression
+        
+        html += f"""
+        <div style="margin-bottom: 8px;">
+            <div style="display: flex; align-items: center; margin-bottom: 4px;">
+                <div style="width: 200px; font-family: monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="{expression}">
+                    {display_expr}
+                </div>
+                <div style="margin-left: 10px; font-weight: bold; min-width: 30px;">{count}</div>
+            </div>
+            <div style="background: #e2e8f0; height: 20px; border-radius: 3px; overflow: hidden;">
+                <div style="background: #4F46E5; height: 100%; width: {percentage}%; transition: width 0.3s ease;"></div>
+            </div>
+        </div>
+        """
+    
+    html += """
+        </div>
+    </div>
+    """
+    
+    return html
 
 @app.route('/get_entropy_detail/<int:collision_number>')
 def get_entropy_detail(collision_number):
-    config_id = int(request.args.get("config_id"))
-    result = get_entropy_and_histogram(config_id, collision_number)
-    entropy = result["entropy"]
-    histogram = result["histogram"]
+    try:
+        config_id_param = request.args.get("config_id")
+        if not config_id_param or config_id_param == "undefined":
+            return "Error: No valid config_id provided", 400
+        
+        config_id = int(config_id_param)
+        print(f"[DEBUG] Fetching histogram for config_id={config_id}, collision={collision_number}")
+        print(f"[DEBUG] Current working directory: {os.getcwd()}")
+        db_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'alchemy_experiments.db'))
+        print(f"[DEBUG] Database path: {db_path}")
+        print(f"[DEBUG] Database exists: {os.path.exists(db_path)}")
+        
+        result = get_entropy_and_histogram(config_id, collision_number)
+        entropy = result["entropy"]
+        histogram = result["histogram"]
+        
+        print(f"[DEBUG] Found {len(histogram)} expressions in histogram")
+        print(f"[DEBUG] Entropy value: {entropy}")
+        print(f"[DEBUG] Histogram data: {histogram[:3] if histogram else 'Empty'}")
 
-    script, div = create_histogram_bokeh(histogram)
+        histogram_html = create_histogram_html(histogram)
 
-    return f"""
-    <div class="card-header">
-        <h3 class="card-title">Details for Collision {collision_number}</h3>
-    </div>
-    <div class="card-body">
-        <p><strong>Entropy:</strong> {entropy:.4f}</p>
-        <div>{div}</div>
-    </div>
-    <script>{script}</script>
-    """
+        return f"""
+        <div class="card-header">
+            <h3 class="card-title">Details for Collision {collision_number}</h3>
+        </div>
+        <div class="card-body">
+            <p><strong>Entropy:</strong> {entropy:.4f}</p>
+            {histogram_html}
+        </div>
+        """
+    except ValueError as e:
+        return f"Error: Invalid config_id or collision_number - {str(e)}", 400
+    except Exception as e:
+        print(f"[ERROR] Exception in get_entropy_detail: {str(e)}")
+        return f"Error: {str(e)}", 500
 
 
 @app.route('/dashboard')
